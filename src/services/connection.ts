@@ -136,23 +136,30 @@ export class PersistentConnection implements ConnectionManager {
   }
 }
 
-/** Sliding window rate limiter — no module-level side effects */
-const MOVE_RATE_LIMIT = 30;
+/** Sliding window rate limiter — configurable via env vars */
 const WINDOW_MS = 60_000;
 const moveTimestamps: number[] = [];
 
+function getMoveRateLimit(): number {
+  const raw = process.env["FARMBOT_MOVE_RATE_LIMIT"];
+  if (!raw) return 30;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+}
+
 export function checkMoveRateLimit(): Result<void> {
+  const limit = getMoveRateLimit();
   const now = Date.now();
   // Remove timestamps outside the window
   while (moveTimestamps.length > 0 && (moveTimestamps[0] ?? 0) <= now - WINDOW_MS) {
     moveTimestamps.shift();
   }
-  if (moveTimestamps.length >= MOVE_RATE_LIMIT) {
+  if (moveTimestamps.length >= limit) {
     return fail({
       code: "RATE_LIMITED",
-      message: `Rate limit exceeded: ${MOVE_RATE_LIMIT} moves per ${WINDOW_MS / 1000}s window`,
+      message: `Rate limit exceeded: ${limit} moves per ${WINDOW_MS / 1000}s window. Override with FARMBOT_MOVE_RATE_LIMIT env var.`,
       retryable: true,
-      hint: "Wait before sending more move commands",
+      hint: "Wait a few seconds before sending more move commands, or raise FARMBOT_MOVE_RATE_LIMIT (default 30).",
     });
   }
   moveTimestamps.push(now);

@@ -18,7 +18,7 @@ import {
   AddPlantParamsSchema,
   AddFarmEventParamsSchema,
 } from "./types/schemas.js";
-import { apiGet, apiPost, apiDelete } from "./services/api.js";
+import { apiGet, apiPost, apiPatch, apiDelete } from "./services/api.js";
 import { readDeviceState } from "./services/device-state.js";
 import type { AppError, Result } from "./types/result.js";
 import type { OutputEnvelope } from "./types/schemas.js";
@@ -414,7 +414,7 @@ program
     }
 
     await withConnection("lua", json, async (bot) => {
-      const result = await withTimeout(bot.lua(params.data.code), timeout, "Lua execution");
+      const result = await withTimeout(bot.lua(params.data.code), timeout, "Lua execution", { longRunning: true });
       if (!result.ok) return result;
       return { ok: true as const, data: result.data };
     });
@@ -819,7 +819,7 @@ program
       return;
     }
     await withConnection("sequence run", json, async (bot) => {
-      const result = await withTimeout(bot.execSequence(seqId), timeout, `Run sequence ${seqId}`);
+      const result = await withTimeout(bot.execSequence(seqId), timeout, `Run sequence ${seqId}`, { longRunning: true });
       if (!result.ok) return result;
       return { ok: true as const, data: { sequenceId: seqId, status: "completed" } };
     });
@@ -959,6 +959,594 @@ program
     const { json } = getOpts();
     const result = await apiGet<unknown>("device");
     formatOutput("device", result, json);
+  });
+
+// ── Helper: simple list-style commands (REST GET) ───────────────────
+
+function addListCommand(name: string, path: string, description: string): void {
+  program
+    .command(name)
+    .description(description)
+    .action(async () => {
+      const { json } = getOpts();
+      const result = await apiGet<unknown>(path);
+      formatOutput(name, result, json);
+    });
+}
+
+function addGetByIdCommand(name: string, path: (id: number) => string, description: string): void {
+  program
+    .command(name)
+    .description(description)
+    .argument("<id>", "Resource ID")
+    .action(async (id: string) => {
+      const { json } = getOpts();
+      const idNum = parseInt(id, 10);
+      if (isNaN(idNum)) {
+        formatOutput(name, { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+        return;
+      }
+      const result = await apiGet<unknown>(path(idNum));
+      formatOutput(name, result, json);
+    });
+}
+
+function addDeleteByIdCommand(name: string, path: (id: number) => string, description: string): void {
+  program
+    .command(name)
+    .description(description)
+    .argument("<id>", "Resource ID")
+    .action(async (id: string) => {
+      const { json } = getOpts();
+      const idNum = parseInt(id, 10);
+      if (isNaN(idNum)) {
+        formatOutput(name, { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+        return;
+      }
+      const result = await apiDelete(path(idNum));
+      if (result.ok) {
+        formatOutput(name, { ok: true as const, data: `Deleted (id: ${idNum}).` }, json);
+      } else {
+        formatOutput(name, result, json);
+      }
+    });
+}
+
+// ── Points / weeds ──────────────────────────────────────────────────
+
+program
+  .command("points")
+  .description("List points (plants, weeds, generic markers, tool slots). Use --type to filter.")
+  .option("--type <pointer_type>", "Plant | Weed | GenericPointer | ToolSlot")
+  .action(async (opts: { type?: string }) => {
+    const { json } = getOpts();
+    const path = opts.type ? `points?filter=${opts.type}` : "points";
+    const result = await apiGet<unknown>(path);
+    formatOutput("points", result, json);
+  });
+
+program
+  .command("point-add")
+  .description("Add a Weed or GenericPointer point")
+  .requiredOption("--type <pointer_type>", "Weed | GenericPointer")
+  .requiredOption("--name <name>", "Point name")
+  .requiredOption("--x <mm>", "X coordinate")
+  .requiredOption("--y <mm>", "Y coordinate")
+  .option("--z <mm>", "Z coordinate", "0")
+  .option("--radius <mm>", "Radius", "25")
+  .action(async (opts: { type: string; name: string; x: string; y: string; z: string; radius: string }) => {
+    const { json } = getOpts();
+    const result = await apiPost("points", {
+      pointer_type: opts.type,
+      name: opts.name,
+      x: parseFloat(opts.x),
+      y: parseFloat(opts.y),
+      z: parseFloat(opts.z),
+      radius: parseFloat(opts.radius),
+      meta: {},
+    });
+    formatOutput("point add", result, json);
+  });
+
+addDeleteByIdCommand("point-remove", (id) => `points/${id}`, "Remove a point by ID");
+
+program
+  .command("plant-update")
+  .description("Update a plant's attributes")
+  .argument("<id>", "Plant ID")
+  .option("--name <name>")
+  .option("--x <mm>")
+  .option("--y <mm>")
+  .option("--z <mm>")
+  .option("--radius <mm>")
+  .option("--openfarm-slug <slug>")
+  .option("--plant-stage <stage>", "planned | planted | sprouted | harvested | removed | active")
+  .option("--planted-at <iso>", "ISO 8601 timestamp")
+  .action(async (id: string, opts: Record<string, string | undefined>) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("plant update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    const changes: Record<string, unknown> = {};
+    if (opts["name"] !== undefined) changes["name"] = opts["name"];
+    if (opts["x"] !== undefined) changes["x"] = parseFloat(opts["x"]);
+    if (opts["y"] !== undefined) changes["y"] = parseFloat(opts["y"]);
+    if (opts["z"] !== undefined) changes["z"] = parseFloat(opts["z"]);
+    if (opts["radius"] !== undefined) changes["radius"] = parseFloat(opts["radius"]);
+    if (opts["openfarmSlug"] !== undefined) changes["openfarm_slug"] = opts["openfarmSlug"];
+    if (opts["plantStage"] !== undefined) changes["plant_stage"] = opts["plantStage"];
+    if (opts["plantedAt"] !== undefined) changes["planted_at"] = opts["plantedAt"];
+    const result = await apiPatch(`points/${idNum}`, changes);
+    formatOutput("plant update", result, json);
+  });
+
+addListCommand("point-groups", "point_groups", "List point groups");
+
+// ── Images ──────────────────────────────────────────────────────────
+
+program
+  .command("images")
+  .description("List photos taken by the FarmBot camera")
+  .option("--limit <n>", "Max images to return")
+  .action(async (opts: { limit?: string }) => {
+    const { json } = getOpts();
+    const path = opts.limit ? `images?per_page=${parseInt(opts.limit, 10)}` : "images";
+    const result = await apiGet<unknown>(path);
+    formatOutput("images", result, json);
+  });
+
+addGetByIdCommand("image", (id) => `images/${id}`, "Get a single image by ID (returns URL + metadata)");
+addDeleteByIdCommand("image-remove", (id) => `images/${id}`, "Delete an image by ID");
+
+// ── Logs ────────────────────────────────────────────────────────────
+
+program
+  .command("logs")
+  .description("List FarmBot device logs (toast messages, errors, lifecycle)")
+  .option("--type <type>", "info | success | warn | error | busy | fun | debug | assertion")
+  .option("--verbosity <n>", "0-3")
+  .option("--limit <n>", "Max log entries")
+  .action(async (opts: { type?: string; verbosity?: string; limit?: string }) => {
+    const { json } = getOpts();
+    const params = new URLSearchParams();
+    if (opts.type) params.set("type", opts.type);
+    if (opts.verbosity !== undefined) params.set("verbosity", opts.verbosity);
+    if (opts.limit) params.set("per_page", opts.limit);
+    const qs = params.toString();
+    const result = await apiGet<unknown>(`logs${qs ? `?${qs}` : ""}`);
+    formatOutput("logs", result, json);
+  });
+
+// ── Read endpoints ──────────────────────────────────────────────────
+
+addListCommand("sensor-readings", "sensor_readings", "List recorded sensor readings");
+addListCommand("curves", "curves", "List water/spread/height curves");
+addGetByIdCommand("curve", (id) => `curves/${id}`, "Get a single curve by ID");
+addListCommand("alerts", "alerts", "List active alerts");
+addListCommand("farmwares", "farmware_installations", "List installed farmwares");
+addListCommand("farmware-envs", "farmware_envs", "List farmware env vars (camera calibration, weed detector thresholds)");
+addListCommand("diagnostic-dumps", "diagnostic_dumps", "List diagnostic dumps (may 404 on some servers)");
+addListCommand("telemetry", "telemetries", "List telemetry samples");
+addListCommand("saved-gardens", "saved_gardens", "List saved gardens");
+addListCommand("plant-templates", "plant_templates", "List plant_templates (members of saved gardens)");
+
+// Farmware env upsert
+program
+  .command("farmware-env-set")
+  .description("Set a farmware env var (upsert by key)")
+  .requiredOption("--key <key>")
+  .requiredOption("--value <value>")
+  .action(async (opts: { key: string; value: string }) => {
+    const { json } = getOpts();
+    const result = await apiPost("farmware_envs", { key: opts.key, value: opts.value });
+    formatOutput("farmware-env-set", result, json);
+  });
+
+// ── Configs (R/W) ───────────────────────────────────────────────────
+
+function addConfigCommands(name: string, path: string, description: string): void {
+  program
+    .command(`${name}-get`)
+    .description(`Get ${description}`)
+    .action(async () => {
+      const { json } = getOpts();
+      const result = await apiGet<unknown>(path);
+      formatOutput(`${name} get`, result, json);
+    });
+  program
+    .command(`${name}-patch`)
+    .description(`Patch ${description}. Pass --values as JSON.`)
+    .requiredOption("--values <json>", "JSON object of changed values")
+    .action(async (opts: { values: string }) => {
+      const { json } = getOpts();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(opts.values);
+      } catch {
+        formatOutput(`${name} patch`, { ok: false, error: { code: "API_ERROR" as const, message: "--values must be valid JSON", retryable: false } }, json);
+        return;
+      }
+      const result = await apiPatch(path, parsed);
+      formatOutput(`${name} patch`, result, json);
+    });
+}
+
+addConfigCommands("firmware-config", "firmware_config", "firmware config (axis lengths, motor speeds)");
+addConfigCommands("fbos-config", "fbos_config", "FarmBot OS config");
+addConfigCommands("web-app-config", "web_app_config", "web app config");
+
+// ── Regimens ────────────────────────────────────────────────────────
+
+addListCommand("regimens", "regimens", "List all regimens (recurring schedules)");
+addGetByIdCommand("regimen", (id) => `regimens/${id}`, "Get a regimen by ID with its regimen_items");
+
+program
+  .command("regimen-add")
+  .description("Create a regimen. Pass --items as JSON: [{sequence_id, time_offset}, ...]")
+  .requiredOption("--name <name>")
+  .option("--color <color>", "blue|green|yellow|orange|purple|pink|gray|red", "gray")
+  .requiredOption("--items <json>", "JSON array of regimen_items")
+  .action(async (opts: { name: string; color: string; items: string }) => {
+    const { json } = getOpts();
+    let items: unknown;
+    try {
+      items = JSON.parse(opts.items);
+    } catch {
+      formatOutput("regimen add", { ok: false, error: { code: "API_ERROR" as const, message: "--items must be valid JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPost("regimens", {
+      name: opts.name,
+      color: opts.color,
+      regimen_items: items,
+      body: [],
+    });
+    formatOutput("regimen add", result, json);
+  });
+
+program
+  .command("regimen-update")
+  .description("Update a regimen. Pass --changes as JSON.")
+  .argument("<id>", "Regimen ID")
+  .requiredOption("--changes <json>", "JSON object of changes")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("regimen update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try {
+      changes = JSON.parse(opts.changes);
+    } catch {
+      formatOutput("regimen update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be valid JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`regimens/${idNum}`, changes);
+    formatOutput("regimen update", result, json);
+  });
+
+addDeleteByIdCommand("regimen-remove", (id) => `regimens/${id}`, "Delete a regimen by ID");
+
+// ── Sequences (CRUD) ────────────────────────────────────────────────
+
+addGetByIdCommand("sequence", (id) => `sequences/${id}`, "Get a sequence by ID");
+
+program
+  .command("sequence-add")
+  .description("Create a sequence. --body is JSON CeleryScript array.")
+  .requiredOption("--name <name>")
+  .option("--color <color>", "blue|green|yellow|orange|purple|pink|gray|red", "gray")
+  .requiredOption("--body <json>", "JSON array of step objects")
+  .option("--args <json>", "Optional locals/args JSON")
+  .action(async (opts: { name: string; color: string; body: string; args?: string }) => {
+    const { json } = getOpts();
+    let body: unknown, argsObj: unknown;
+    try {
+      body = JSON.parse(opts.body);
+      argsObj = opts.args ? JSON.parse(opts.args) : { version: 20180209, locals: { kind: "scope_declaration", args: {} } };
+    } catch {
+      formatOutput("sequence add", { ok: false, error: { code: "API_ERROR" as const, message: "--body / --args must be valid JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPost("sequences", { name: opts.name, color: opts.color, body, args: argsObj });
+    formatOutput("sequence add", result, json);
+  });
+
+program
+  .command("sequence-update")
+  .description("Update a sequence. --changes JSON.")
+  .argument("<id>", "Sequence ID")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("sequence update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("sequence update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be valid JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`sequences/${idNum}`, changes);
+    formatOutput("sequence update", result, json);
+  });
+
+addDeleteByIdCommand("sequence-remove", (id) => `sequences/${id}`, "Delete a sequence by ID");
+
+// ── Point groups (CRUD) ─────────────────────────────────────────────
+
+addGetByIdCommand("point-group", (id) => `point_groups/${id}`, "Get a point group by ID");
+
+program
+  .command("point-group-add")
+  .description("Create a point group with given member point IDs")
+  .requiredOption("--name <name>")
+  .requiredOption("--point-ids <csv>", "Comma-separated point IDs")
+  .option("--sort-type <type>", "xy_ascending|yx_ascending|xy_descending|yx_descending|random|nn", "xy_ascending")
+  .action(async (opts: { name: string; pointIds: string; sortType: string }) => {
+    const { json } = getOpts();
+    const ids = opts.pointIds.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+    const result = await apiPost("point_groups", {
+      name: opts.name,
+      point_ids: ids,
+      sort_type: opts.sortType,
+      criteria: { day: { op: "<", days_ago: 0 }, string_eq: {}, number_eq: {}, number_lt: {}, number_gt: {} },
+    });
+    formatOutput("point-group add", result, json);
+  });
+
+program
+  .command("point-group-update")
+  .description("Update a point group. --changes JSON.")
+  .argument("<id>")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("point-group update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("point-group update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`point_groups/${idNum}`, changes);
+    formatOutput("point-group update", result, json);
+  });
+
+addDeleteByIdCommand("point-group-remove", (id) => `point_groups/${id}`, "Delete a point group by ID");
+
+// ── point-update (generic) + event-update ───────────────────────────
+
+program
+  .command("point-update")
+  .description("Update any point's attributes (use plant-update for plants for plant_stage)")
+  .argument("<id>")
+  .option("--name <name>")
+  .option("--x <mm>")
+  .option("--y <mm>")
+  .option("--z <mm>")
+  .option("--radius <mm>")
+  .action(async (id: string, opts: Record<string, string | undefined>) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("point update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    const changes: Record<string, unknown> = {};
+    if (opts["name"] !== undefined) changes["name"] = opts["name"];
+    if (opts["x"] !== undefined) changes["x"] = parseFloat(opts["x"]);
+    if (opts["y"] !== undefined) changes["y"] = parseFloat(opts["y"]);
+    if (opts["z"] !== undefined) changes["z"] = parseFloat(opts["z"]);
+    if (opts["radius"] !== undefined) changes["radius"] = parseFloat(opts["radius"]);
+    const result = await apiPatch(`points/${idNum}`, changes);
+    formatOutput("point update", result, json);
+  });
+
+program
+  .command("event-update")
+  .description("Update a farm event. --changes JSON.")
+  .argument("<id>")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("event update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("event update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`farm_events/${idNum}`, changes);
+    formatOutput("event update", result, json);
+  });
+
+// ── Tools / peripherals / sensors (CRUD) ────────────────────────────
+
+program
+  .command("tool-add")
+  .description("Register a tool")
+  .requiredOption("--name <name>")
+  .option("--flow-rate <ml/s>", "Flow rate in mL/s for watering tools")
+  .action(async (opts: { name: string; flowRate?: string }) => {
+    const { json } = getOpts();
+    const result = await apiPost("tools", {
+      name: opts.name,
+      flow_rate_ml_per_s: opts.flowRate ? parseFloat(opts.flowRate) : 0,
+    });
+    formatOutput("tool add", result, json);
+  });
+
+program
+  .command("tool-update")
+  .description("Update a tool. --changes JSON.")
+  .argument("<id>")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("tool update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("tool update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`tools/${idNum}`, changes);
+    formatOutput("tool update", result, json);
+  });
+
+addDeleteByIdCommand("tool-remove", (id) => `tools/${id}`, "Delete a tool by ID");
+
+program
+  .command("peripheral-add")
+  .description("Register a peripheral on a GPIO pin")
+  .requiredOption("--pin <pin>")
+  .requiredOption("--label <label>")
+  .option("--mode <mode>", "0 (digital) or 1 (analog)", "0")
+  .action(async (opts: { pin: string; label: string; mode: string }) => {
+    const { json } = getOpts();
+    const result = await apiPost("peripherals", {
+      pin: parseInt(opts.pin, 10),
+      label: opts.label,
+      mode: parseInt(opts.mode, 10),
+    });
+    formatOutput("peripheral add", result, json);
+  });
+
+program
+  .command("peripheral-update")
+  .description("Update a peripheral. --changes JSON.")
+  .argument("<id>")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("peripheral update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("peripheral update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`peripherals/${idNum}`, changes);
+    formatOutput("peripheral update", result, json);
+  });
+
+addDeleteByIdCommand("peripheral-remove", (id) => `peripherals/${id}`, "Delete a peripheral by ID");
+
+program
+  .command("sensor-add")
+  .description("Register a sensor on a GPIO pin")
+  .requiredOption("--pin <pin>")
+  .requiredOption("--label <label>")
+  .option("--mode <mode>", "0 (digital) or 1 (analog)", "0")
+  .action(async (opts: { pin: string; label: string; mode: string }) => {
+    const { json } = getOpts();
+    const result = await apiPost("sensors", {
+      pin: parseInt(opts.pin, 10),
+      label: opts.label,
+      mode: parseInt(opts.mode, 10),
+    });
+    formatOutput("sensor add", result, json);
+  });
+
+program
+  .command("sensor-update")
+  .description("Update a sensor. --changes JSON.")
+  .argument("<id>")
+  .requiredOption("--changes <json>")
+  .action(async (id: string, opts: { changes: string }) => {
+    const { json } = getOpts();
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum)) {
+      formatOutput("sensor update", { ok: false, error: { code: "API_ERROR" as const, message: "ID must be a number", retryable: false } }, json);
+      return;
+    }
+    let changes: unknown;
+    try { changes = JSON.parse(opts.changes); } catch {
+      formatOutput("sensor update", { ok: false, error: { code: "API_ERROR" as const, message: "--changes must be JSON", retryable: false } }, json);
+      return;
+    }
+    const result = await apiPatch(`sensors/${idNum}`, changes);
+    formatOutput("sensor update", result, json);
+  });
+
+addDeleteByIdCommand("sensor-remove", (id) => `sensors/${id}`, "Delete a sensor by ID");
+
+// ── execute_script + high-level setup ───────────────────────────────
+
+program
+  .command("execute-script")
+  .description("Run an installed farmware on-device by label")
+  .argument("<label>", "Farmware label (e.g. camera-calibration, plant-detection)")
+  .option("--env <key=value...>", "Pass env var(s)", (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .action(async (label: string, opts: { env: string[] }) => {
+    const { json, timeout } = getOpts();
+    const envPairs = opts.env.length
+      ? opts.env.map((kv) => {
+          const idx = kv.indexOf("=");
+          if (idx < 0) return null;
+          return { kind: "pair" as const, args: { label: kv.slice(0, idx), value: kv.slice(idx + 1) } };
+        }).filter(Boolean) as Array<{ kind: "pair"; args: { label: string; value: string } }>
+      : undefined;
+    await withConnection("execute-script", json, async (bot) => {
+      const result = await withTimeout(bot.execScript(label, envPairs), timeout, `Run farmware ${label}`, { longRunning: true });
+      if (!result.ok) return result;
+      return { ok: true as const, data: { farmware: label, status: "started" } };
+    });
+  });
+
+program
+  .command("calibrate-camera")
+  .description("Run the camera calibration farmware (~30s)")
+  .action(async () => {
+    const { json, timeout } = getOpts();
+    await withConnection("calibrate-camera", json, async (bot) => {
+      const result = await withTimeout(bot.execScript("camera-calibration"), timeout, "Camera calibration", { longRunning: true });
+      if (!result.ok) return result;
+      return { ok: true as const, data: "Camera calibration started. Results saved to farmware_envs (CAMERA_CALIBRATION_*)." };
+    });
+  });
+
+program
+  .command("measure-soil-height")
+  .description("Measure soil height at the current position")
+  .action(async () => {
+    const { json, timeout } = getOpts();
+    await withConnection("measure-soil-height", json, async (bot) => {
+      const result = await withTimeout(bot.execScript("measure-soil-height"), timeout, "Measure soil height", { longRunning: true });
+      if (!result.ok) return result;
+      return { ok: true as const, data: "Soil height measurement started." };
+    });
+  });
+
+program
+  .command("detect-weeds")
+  .description("Run plant/weed detection on the latest photo at the current position")
+  .action(async () => {
+    const { json, timeout } = getOpts();
+    await withConnection("detect-weeds", json, async (bot) => {
+      const result = await withTimeout(bot.execScript("plant-detection"), timeout, "Weed detection", { longRunning: true });
+      if (!result.ok) return result;
+      return { ok: true as const, data: "Weed detection started. Detected weeds saved as Weed points." };
+    });
   });
 
 program.parse();
